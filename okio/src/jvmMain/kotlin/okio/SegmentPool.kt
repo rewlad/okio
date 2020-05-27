@@ -15,10 +15,10 @@
  */
 package okio
 
-import okio.SegmentPool.LOCK
 import okio.SegmentPool.MAX_SIZE
 import okio.SegmentPool.recycle
 import okio.SegmentPool.take
+import java.lang.Integer.parseInt
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -40,25 +40,84 @@ import java.util.concurrent.atomic.AtomicReference
  * target pool size by a few segments doesn't harm performance, and imperfect enforcement is less
  * code.
  */
+
+internal interface AbstractSegmentPool {
+  fun take(): Segment
+  fun recycle(segment: Segment)
+  fun getByteCount(): Long
+}
+
 internal actual object SegmentPool {
+  private val impl: AbstractSegmentPool = when(System.getenv("OKIO_SEGMENT_POOL")) {
+    "NOOP" -> NoOpSegmentPool()
+    "THREAD_LOCAL" -> ThreadLocalSegmentPool()
+    "CAS" -> CASSegmentPool()
+    else -> throw Exception("need env OKIO_SEGMENT_POOL=NOOP|CAS|THREAD_LOCAL")
+  }
+
   /** The maximum number of bytes to pool.  */
   // TODO: Is 64 KiB a good maximum size? Do we ever have that many idle segments?
-  actual val MAX_SIZE = 64 * 1024L // 64 KiB.
+  actual val MAX_SIZE = parseInt(System.getenv("OKIO_SEGMENT_POOL_SIZE")?:"64") * 1024L // default is 64 KiB.
+  @JvmStatic actual fun take(): Segment = impl.take()
+  @JvmStatic actual fun recycle(segment: Segment) = impl.recycle(segment)
+  actual val byteCount: Long = impl.getByteCount()
+}
+
+internal class NoOpSegmentPool: AbstractSegmentPool {
+  override fun take(): Segment = Segment()
+  override fun recycle(segment: Segment) {}
+  override fun getByteCount(): Long = 0L
+}
+
+
+internal class UnsafeSegmentPool(): AbstractSegmentPool {
+  private var first: Segment? = null
+  private var byteCount = 0L
+  override fun getByteCount(): Long = byteCount
+  override fun take(): Segment {
+    val res = first
+    return if(res === null) Segment() else {
+      first = res.next
+      res.next = null
+      byteCount -= Segment.SIZE
+      res
+    }
+  }
+  override fun recycle(segment: Segment) {
+    require(segment.next == null && segment.prev == null)
+    if (segment.shared) return // This segment cannot be recycled.
+    if (byteCount >= MAX_SIZE) return // Pool is full.
+    segment.next = first
+    segment.limit = 0
+    segment.pos = 0
+    first = segment
+    byteCount += Segment.SIZE
+  }
+}
+
+internal class ThreadLocalSegmentPool: AbstractSegmentPool {
+  private val impl = object: ThreadLocal<AbstractSegmentPool>() {
+    override fun initialValue(): AbstractSegmentPool = UnsafeSegmentPool()
+  }
+  override fun take(): Segment = impl.get().take()
+  override fun recycle(segment: Segment) = impl.get().recycle(segment)
+  override fun getByteCount(): Long = impl.get().getByteCount()
+}
+
+internal class CASSegmentPool: AbstractSegmentPool {
 
   /** A sentinel segment to indicate that the linked list is currently being modified. */
   private val LOCK = Segment(ByteArray(0), pos = 0, limit = 0, shared = false, owner = false)
 
   /** Singly-linked list of segments. */
-  private var firstRef = AtomicReference<Segment?>()
+  private val firstRef = AtomicReference<Segment?>()
 
   /** Total bytes in this pool. */
-  private var atomicByteCount = AtomicLong()
+  private val atomicByteCount = AtomicLong()
 
-  actual val byteCount: Long
-    get() = atomicByteCount.get()
+  override fun getByteCount(): Long = atomicByteCount.get()
 
-  @JvmStatic
-  actual fun take(): Segment {
+  override fun take(): Segment {
     val first = firstRef.getAndSet(LOCK)
     when {
       first === LOCK -> {
@@ -80,8 +139,7 @@ internal actual object SegmentPool {
     }
   }
 
-  @JvmStatic
-  actual fun recycle(segment: Segment) {
+  override fun recycle(segment: Segment) {
     require(segment.next == null && segment.prev == null)
     if (segment.shared) return // This segment cannot be recycled.
     if (atomicByteCount.get() >= MAX_SIZE) return // Pool is full.
