@@ -48,7 +48,7 @@ internal interface AbstractSegmentPool {
 }
 
 internal actual object SegmentPool {
-  private val impl: AbstractSegmentPool = when(System.getenv("OKIO_SEGMENT_POOL")) {
+  private val impl: AbstractSegmentPool = when(System.getenv("OKIO_SEGMENT_POOL")) { // ? may be use ServiceLoader (java SPI)
     "NOOP" -> NoOpSegmentPool()
     "THREAD_LOCAL" -> ThreadLocalSegmentPool()
     "CAS" -> CASSegmentPool()
